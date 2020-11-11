@@ -5,6 +5,7 @@ from net.layer import *
 from config import net_config as config
 import copy
 from torch.nn.parallel.data_parallel import data_parallel
+#from torch.nn.parallel import DistributedDataParallel as DDP
 import time
 import torch.nn.functional as F
 from utils.util import center_box_to_coord_box, ext2factor, clip_boxes
@@ -252,6 +253,66 @@ class MaskHead(nn.Module):
 
         return out
 
+class LHIHead(nn.Module):
+    def __init__(self, cfg, in_channels=1, mask_thresh=0.0625/2):
+        super(LHIHead, self).__init__()
+        self.num_class = cfg['num_class']
+        self.crop_size = cfg['lhi_crop_size']
+        self.mask_thresh = mask_thresh
+
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(64, 32, kernel_size=3, padding=1)
+        self.fc1 = nn.Linear(32 * self.crop_size[0] * self.crop_size[1], 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.logits = nn.Linear(256, self.num_class)
+        self.deltas = nn.Linear(256, self.num_class * 6)
+    
+    def compute_LHI(self, crop_img):
+        #initial LHI, size=lhi_crop_size, full with number of depth of cropped image   
+        _, D, H, W = crop_img.shape
+        LHI = torch.full((H, W), D).cuda()
+        for i in range(1, D):
+            # threshold
+            mask = torch.abs(crop_img[0, i] - crop_img[0, i-1]) > self.mask_thresh
+            # if no change
+            LHI[mask==0] -= 1
+        # nomalize to 0~1
+        LHI = LHI / D
+        #resize LHI to dest_size
+        LHI = F.adaptive_max_pool2d(LHI.unsqueeze(0), self.crop_size)
+        return LHI
+
+    def forward(self, detections, img):
+        # Squeeze the first dimension to recover from protection on avoiding split by dataparallel      
+        img = img.squeeze(0)
+
+        _, _, D, H, W = img.shape
+
+        ims = []
+        lhi_ims = []
+        
+        for detection in detections:
+            b, p, z_start, y_start, x_start, z_end, y_end, x_end = detection
+
+            im = img[int(b), :, int(z_start):int(z_end), int(y_start):int(y_end), int(x_start):int(x_end)].contiguous()
+            ims.append(im)
+
+            lhi_im = self.compute_LHI(im)
+            lhi_ims.append(lhi_im)
+        
+        #ims = torch.cat(ims, 0).unsqueeze(1)
+        lhi_ims = torch.cat(lhi_ims, 0).unsqueeze(1)
+        #print("crop_lhi:", crop_lhi.shape)
+        x = self.conv1(lhi_ims)
+        x = self.conv2(x)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x), inplace=True)
+        x = F.relu(self.fc2(x), inplace=True)
+        
+        logits = self.logits(x)
+        deltas = self.deltas(x)
+
+        return logits, deltas, lhi_ims, #ims
 
 def crop_mask_regions(masks, crop_boxes):
     out = []
@@ -337,14 +398,20 @@ class NoduleNet(nn.Module):
         self.rcnn_head = RcnnHead(config, in_channels=64)
         self.rcnn_crop = CropRoi(self.cfg, cfg['rcnn_crop_size'])
         self.mask_head = MaskHead(config, in_channels=128)
+        self.lhi_head = LHIHead(config, in_channels=1)
         self.use_rcnn = False
         self.use_mask = False
+        self.use_lhi = False
 
         # self.rpn_loss = Loss(cfg['num_hard'])
         
 
     def forward(self, inputs, truth_boxes, truth_labels, truth_masks, masks, split_combiner=None, nzhw=None):
-        features, feat_4 = data_parallel(self.feature_net, (inputs)); #print('fs[-1] ', fs[-1].shape)
+        #if config['distributed']:
+        #    features, feat_4 = DDP(self.feature_net, (inputs))
+
+        #else:
+        features, feat_4 = data_parallel(self.feature_net, (inputs)) #print('fs[-1] ', fs[-1].shape)
         fs = features[-1]
 
         self.rpn_logits_flat, self.rpn_deltas_flat = data_parallel(self.rpn, fs)
@@ -384,46 +451,75 @@ class NoduleNet(nn.Module):
                 self.rcnn_logits, self.rcnn_deltas = data_parallel(self.rcnn_head, rcnn_crops)
                 self.detections, self.keeps = rcnn_nms(self.cfg, self.mode, inputs, self.rpn_proposals, 
                                                                         self.rcnn_logits, self.rcnn_deltas)
+            else:
+                self.rcnn_logits, self.rcnn_deltas, self.detections = None
+            if (self.use_mask or self.use_lhi) and len(self.detections):
 
-            if self.mode in ['eval']:
-                # Ensemble
-                fpr_res = get_probability(self.cfg, self.mode, inputs, self.rpn_proposals,  self.rcnn_logits, self.rcnn_deltas)
-                self.ensemble_proposals[:, 1] = (self.ensemble_proposals[:, 1] + fpr_res[:, 0]) / 2
+                if self.use_lhi:
+                    # keep batch index index, p, z, y, x, d, h, w
+                    self.rcnn_proposals = copy.deepcopy(self.detections[:, [0, 1, 2, 3, 4, 5, 6, 7]])
+                    self.rcnn_proposals, self.lhi_labels, self.lhi_assigns, self.lhi_targets = make_lhi_target(self.cfg, self.mode, inputs, self.rcnn_proposals, truth_boxes, truth_labels, truth_masks)
 
-            if self.use_mask and len(self.detections):
-                # keep batch index, z, y, x, d, h, w, class
-                self.crop_boxes = []
-                if len(self.detections):
-                    self.crop_boxes = self.detections[:, [0, 2, 3, 4, 5, 6, 7, 8]].cpu().numpy().copy()
-                    self.crop_boxes[:, 1:-1] = center_box_to_coord_box(self.crop_boxes[:, 1:-1])
-                    self.crop_boxes = self.crop_boxes.astype(np.int32)
-                    self.crop_boxes[:, 1:-1] = ext2factor(self.crop_boxes[:, 1:-1], 4)
-                    self.crop_boxes[:, 1:-1] = clip_boxes(self.crop_boxes[:, 1:-1], inputs.shape[2:])
-                
+                self.mask_crop_boxes = []
+                self.lhi_crop_boxes = []
+                if self.use_lhi:
+                    self.lhi_crop_boxes = self.rcnn_proposals.cpu().numpy().copy()
+                    self.lhi_crop_boxes[:, 2:] = center_box_to_coord_box(self.lhi_crop_boxes[:, 2:])
+                    self.lhi_crop_boxes[:, 2:] = ext2factor(self.lhi_crop_boxes[:, 2:], 4)
+                    self.lhi_crop_boxes[:, 2:] = clip_boxes(self.lhi_crop_boxes[:, 2:], inputs.shape[2:])
+                if self.use_mask:
+                    # keep batch index, z, y, x, d, h, w, class
+                    self.mask_crop_boxes = self.detections[:, [0, 2, 3, 4, 5, 6, 7, 8]].cpu().numpy().copy()
+                    self.mask_crop_boxes[:, 1:-1] = center_box_to_coord_box(self.mask_crop_boxes[:, 1:-1])
+                    self.mask_crop_boxes = self.mask_crop_boxes.astype(np.int32)
+                    self.mask_crop_boxes[:, 1:-1] = ext2factor(self.mask_crop_boxes[:, 1:-1], 4)
+                    self.mask_crop_boxes[:, 1:-1] = clip_boxes(self.mask_crop_boxes[:, 1:-1], inputs.shape[2:])
                 # if self.mode in ['eval', 'test']:
-                #     self.crop_boxes = top1pred(self.crop_boxes)
+                #     self.mask_crop_boxes = top1pred(self.mask_crop_boxes)
                 # else:
-                #     self.crop_boxes = random1pred(self.crop_boxes)
-
+                #     self.mask_crop_boxes = random1pred(self.mask_crop_boxes)
                 if self.mode in ['train', 'valid']:
-                    self.mask_targets = make_mask_target(self.cfg, self.mode, inputs, self.crop_boxes,
-                        truth_boxes, truth_labels, masks)
-
-                # Make sure to keep feature maps not splitted by data parallel
-                features = [t.unsqueeze(0).expand(torch.cuda.device_count(), -1, -1, -1, -1, -1) for t in features]
-                self.mask_probs = data_parallel(self.mask_head, (torch.from_numpy(self.crop_boxes).cuda(), features))
+                    if self.use_mask:
+                        self.mask_targets = make_mask_target(self.cfg, self.mode, inputs, self.mask_crop_boxes,
+                            truth_boxes, truth_labels, masks)
+                
+                if self.use_mask:
+                    # Make sure to keep feature maps not splitted by data parallel
+                    features = [t.unsqueeze(0).expand(torch.cuda.device_count(), -1, -1, -1, -1, -1) for t in features]
+                    self.mask_probs = data_parallel(self.mask_head, (torch.from_numpy(self.mask_crop_boxes).cuda(), features))
+                if self.use_lhi:
+                    # Make sure to keep inputs not splitted by data parallel
+                    inputs = inputs.unsqueeze(0).expand(torch.cuda.device_count(), -1, -1, -1, -1, -1)
+                    self.lhi_logits, self.lhi_deltas, self.crop_lhi = data_parallel(self.lhi_head, (torch.from_numpy(self.lhi_crop_boxes).cuda(), inputs))
 
                 if self.mode in ['eval', 'test']:
-                    mask_keep = mask_nms(self.cfg, self.mode, self.mask_probs, self.crop_boxes, inputs)
-                #    self.crop_boxes = torch.index_select(self.crop_boxes, 0, mask_keep)
-                #    self.detections = torch.index_select(self.detections, 0, mask_keep)
-                #    self.mask_probs = torch.index_select(self.mask_probs, 0, mask_keep)
-                    self.crop_boxes = self.crop_boxes[mask_keep]
-                    self.detections = self.detections[mask_keep]
-                    self.mask_probs = self.mask_probs[mask_keep]
+                    if self.use_mask:
+                        mask_keep = mask_nms(self.cfg, self.mode, self.mask_probs, self.mask_crop_boxes, inputs)
+                    #    self.mask_crop_boxes = torch.index_select(self.mask_crop_boxes, 0, mask_keep)
+                    #    self.detections = torch.index_select(self.detections, 0, mask_keep)
+                    #    self.mask_probs = torch.index_select(self.mask_probs, 0, mask_keep)
+                        self.mask_crop_boxes = self.mask_crop_boxes[mask_keep]
+                        self.detections = self.detections[mask_keep]
+                        self.mask_probs = self.mask_probs[mask_keep]
+                    elif self.use_lhi:
+                        pass
                 
-                self.mask_probs = crop_mask_regions(self.mask_probs, self.crop_boxes)
+                if self.use_mask:
+                    self.mask_probs = crop_mask_regions(self.mask_probs, self.mask_crop_boxes)
+            else:
+                self.mask_crop_boxes, self.lhi_crop_boxes = None, None
+                self.lhi_logits, self.lhi_deltas, self.crop_lhi = None, None, None
+                self.mask_probs = None
 
+            if self.mode in ['eval'] and len(self.rpn_proposals) > 0:
+                # Ensemble
+                fpr_res = get_probability(self.cfg, self.mode, inputs, self.rpn_proposals,  self.rcnn_logits, self.rcnn_deltas)
+                if self.use_lhi and len(self.rcnn_proposals) > 0:
+                    fpr_res_lhi = get_probability_lhi(self.cfg, self.mode, inputs, self.rcnn_proposals,  self.lhi_logits, self.lhi_deltas)
+                    self.ensemble_proposals[:, 1] = (self.ensemble_proposals[:, 1] + fpr_res[:, 0] + fpr_res_lhi[:, 0]) / 3
+                else:
+                    self.ensemble_proposals[:, 1] = (self.ensemble_proposals[:, 1] + fpr_res[:, 0]) / 2
+                
     def forward2(self, inputs, bboxes):
         features = data_parallel(self.feature_net, (inputs)); #print('fs[-1] ', fs[-1].shape)
         fs = features[-1]
@@ -488,8 +584,11 @@ class NoduleNet(nn.Module):
         cfg  = self.cfg
     
         self.rcnn_cls_loss, self.rcnn_reg_loss = torch.zeros(1).cuda(), torch.zeros(1).cuda()
+        self.lhi_cls_loss, self.lhi_reg_loss = torch.zeros(1).cuda(), torch.zeros(1).cuda()
+
         rcnn_stats = None
         mask_stats = None
+        lhi_stats = None
 
         self.mask_loss = torch.zeros(1).cuda()
     
@@ -497,26 +596,31 @@ class NoduleNet(nn.Module):
            rpn_loss( self.rpn_logits_flat, self.rpn_deltas_flat, self.rpn_labels,
             self.rpn_label_weights, self.rpn_targets, self.rpn_target_weights, self.cfg, mode=self.mode)
     
-        if self.use_rcnn:
+        if self.use_rcnn and len(self.rpn_proposals):
             self.rcnn_cls_loss, self.rcnn_reg_loss, rcnn_stats = \
                 rcnn_loss(self.rcnn_logits, self.rcnn_deltas, self.rcnn_labels, self.rcnn_targets)
 
-        if self.use_mask:
+        if self.use_mask and len(self.detections):
             self.mask_loss, mask_losses = mask_loss(self.mask_probs, self.mask_targets)
             mask_stats = [[] for _ in range(cfg['num_class'] - 1)] 
-            for i in range(len(self.crop_boxes)):
-                cat = int(self.crop_boxes[i][-1]) - 1
+            for i in range(len(self.mask_crop_boxes)):
+                cat = int(self.mask_crop_boxes[i][-1]) - 1
                 mask_stats[cat].append(mask_losses[i])
             mask_stats = [np.mean(e) for e in mask_stats]
             mask_stats = np.array(mask_stats)
             mask_stats[mask_stats == 0] = np.nan
+        
+        if self.use_lhi and len(self.detections):
+            self.lhi_cls_loss, self.lhi_reg_loss, lhi_stats = \
+                lhi_loss(self.lhi_logits, self.lhi_deltas, self.lhi_labels, self.lhi_targets)
     
         self.total_loss = self.rpn_cls_loss + self.rpn_reg_loss \
                           + self.rcnn_cls_loss +  self.rcnn_reg_loss \
-                          + self.mask_loss
+                          + self.mask_loss \
+                          + self.lhi_cls_loss +  self.lhi_reg_loss
 
     
-        return self.total_loss, rpn_stats, rcnn_stats, mask_stats
+        return self.total_loss, rpn_stats, rcnn_stats, mask_stats, lhi_stats
 
     def set_mode(self, mode):
         assert mode in ['train', 'valid', 'eval', 'test']

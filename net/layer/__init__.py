@@ -8,3 +8,7 @@ from net.layer.rpn_target import *
 from net.layer.mask_target import *
 from net.layer.mask_loss import *
 from net.layer.mask_nms import *
+from net.layer.lhi_target import *
+from net.layer.lhi_loss import *
+from net.layer.lhi_nms import *
+from net.layer.focal_loss import *

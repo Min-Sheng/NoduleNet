@@ -9,13 +9,14 @@ import math
 import time
 
 class BboxReader(Dataset):
-    def __init__(self, data_dir, set_name, cfg, mode='train', split_combiner=None):
+    def __init__(self, data_dir, set_name, cfg, mode='train', split_combiner=None, lungmask_dir=None):
         self.mode = mode
         self.cfg = cfg
         self.r_rand = cfg['r_rand_crop']
         self.augtype = cfg['augtype']
         self.pad_value = cfg['pad_value']
         self.data_dir = data_dir
+        self.lungmask_dir = lungmask_dir
         self.stride = cfg['stride']
         self.blacklist = cfg['blacklist']
         self.blacklist = []
@@ -24,16 +25,28 @@ class BboxReader(Dataset):
         labels = []
         if set_name.endswith('.csv'):
             self.filenames = np.genfromtxt(set_name, dtype=str)
+            if self.set_name.split('/')[-1] == 'train_list_ALD_0907.csv' or self.set_name.split('/')[-1] == 'test_list_ALD_0907.csv':
+                self.filenames = self.filenames[1:]
         elif set_name.endswith('.npy'):
             self.filenames = np.load(set_name)
 
         if mode != 'test':
             self.filenames = [f for f in self.filenames if (f not in self.blacklist)]
 
+        #def ball2cude(label):
+        #    return np.hstack((label, np.tile(label[:, [-1]], 2)))
+
         for fn in self.filenames:
             l = np.load(os.path.join(data_dir, '%s_label.npy' % fn))
+            if self.set_name.split('/')[-1] == 'train_list_ALD_0907.csv' or self.set_name.split('/')[-1] == 'test_list_ALD_0907.csv':
+                l = l[:,:-1]
+                l = l[l[:,3] > 3] # only keep nodule > 3mm & <30 mm (default: 3)
+                l = l[l[:,3] <30]              
             if np.all(l==0):
                 l=np.array([])
+            #else:
+            #    if len(l[0]) == 4:
+            #        l = ball2cude(l)
             labels.append(l)
 
         self.sample_bboxes = labels
@@ -65,7 +78,10 @@ class BboxReader(Dataset):
             if not is_random_img:
                 bbox = self.bboxes[idx]
                 filename = self.filenames[int(bbox[0])]
-                imgs = self.load_img(filename)
+                imgs = self.load_img(filename)[0]
+                if self.lungmask_dir:
+                    lungmask = self.load_lungmask(filename)[0]
+                    imgs = imgs * lungmask
                 bboxes = self.sample_bboxes[int(bbox[0])]
 
                 isScale = self.augtype['scale'] and (self.mode=='train')
@@ -77,6 +93,9 @@ class BboxReader(Dataset):
                 randimid = np.random.randint(len(self.filenames))
                 filename = self.filenames[randimid]
                 imgs = self.load_img(filename)
+                if self.lungmask_dir:
+                    lungmask = self.load_lungmask(filename)
+                    imgs = imgs * lungmask
                 bboxes = self.sample_bboxes[randimid]
                 isScale = self.augtype['scale'] and (self.mode=='train')
                 sample, target, bboxes, coord = self.crop(imgs, [], bboxes,isScale=False,isRand=True)
@@ -113,9 +132,13 @@ class BboxReader(Dataset):
 #             return [torch.from_numpy(imgs), bboxes, label, image, nzhw]
 
         if self.mode in ['eval']:
-            image = self.load_img(self.filenames[idx])
-            
+            image = self.load_img(self.filenames[idx])[0]
+
             original_image = image[0]
+
+            if self.lungmask_dir:
+                lungmask = self.load_lungmask(self.filenames[idx])[0]
+                image = image * lungmask
 
             image = pad2factor(image[0])
             image = np.expand_dims(image, 0)
@@ -154,7 +177,10 @@ class BboxReader(Dataset):
         img = np.load(os.path.join(self.data_dir, '%s_clean.npy' % (path_to_img)))
         img = img[np.newaxis,...]
         return img
-
+    def load_lungmask(self, path_to_mask):
+        mask = np.load(os.path.join(self.lungmask_dir, '%s_mask_resampled.npy' % (path_to_mask)))
+        mask = mask[np.newaxis,...]
+        return mask
 
 def pad2factor(image, factor=16, pad_value=0):
     depth, height, width = image.shape

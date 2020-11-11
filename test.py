@@ -31,7 +31,8 @@ from evaluationScript.noduleCADEvaluationLUNA16 import noduleCADEvaluation
 plt.rcParams['figure.figsize'] = (24, 16)
 plt.switch_backend('agg')
 this_module = sys.modules[__name__]
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 
 parser = argparse.ArgumentParser()
@@ -47,7 +48,10 @@ parser.add_argument("--out-dir", type=str, default=config['out_dir'],
                     help="path to save the results")
 parser.add_argument("--test-set-name", type=str, default=config['test_set_name'],
                     help="path to save the results")
-
+parser.add_argument("--label_type", type=str, default='bbox',
+                    help="type of the labels")
+parser.add_argument("--prob_threshold", type=float, default=config['prob_threshold'],
+                    help="threshold of the probability")
 
 def main():
     logging.basicConfig(format='[%(levelname)s][%(asctime)s] %(message)s', level=logging.INFO)
@@ -58,11 +62,14 @@ def main():
 
     if args.mode == 'eval':
         data_dir = config['preprocessed_data_dir']
+        lungmask_dir = config['preprocessed_lungmask_dir']
         test_set_name = args.test_set_name
         num_workers = 0
         initial_checkpoint = args.weight
         net = args.net
         out_dir = args.out_dir
+        label_type = args.label_type
+        prob_threshold = args.prob_threshold
 
         net = getattr(this_module, net)(config)
         net = net.cuda()
@@ -85,13 +92,16 @@ def main():
         if not os.path.exists(os.path.join(save_dir, 'FROC')):
             os.makedirs(os.path.join(save_dir, 'FROC'))
 
-        dataset = MaskReader(data_dir, test_set_name, config, mode='eval')
-        eval(net, dataset, save_dir)
+        if label_type == 'bbox':
+            dataset = BboxReader(data_dir, test_set_name, config, mode='eval',lungmask_dir=lungmask_dir)
+        elif label_type == 'mask':
+            dataset = MaskReader(data_dir, test_set_name, config, mode='eval')
+        eval(net, dataset, save_dir, prob_threshold)
     else:
         logging.error('Mode %s is not supported' % (args.mode))
 
 
-def eval(net, dataset, save_dir=None):
+def eval(net, dataset, save_dir=None, prob_threshold=0):
     net.set_mode('eval')
     net.use_mask = False
     net.use_rcnn = True
@@ -179,21 +189,32 @@ def eval(net, dataset, save_dir=None):
     rcnn_res = []
     ensemble_res = []
     for pid in dataset.filenames:
+        if config['shift'] is not None:
+            shift = np.load(config['shift'] + str(pid) + '_origin.npy')[::-1]
+        else:
+            shift = 0
+
         if os.path.exists(os.path.join(save_dir, '%s_rpns.npy' % (pid))):
             rpns = np.load(os.path.join(save_dir, '%s_rpns.npy' % (pid)))
+            rpns = rpns[rpns[:,0] >= prob_threshold]
             rpns = rpns[:, [3, 2, 1, 4, 0]]
+            rpns[:, [0, 1, 2]] = rpns[:, [0, 1, 2]] + shift
             names = np.array([[pid]] * len(rpns))
             rpn_res.append(np.concatenate([names, rpns], axis=1))
 
         if os.path.exists(os.path.join(save_dir, '%s_rcnns.npy' % (pid))):
             rcnns = np.load(os.path.join(save_dir, '%s_rcnns.npy' % (pid)))
+            rcnns = rcnns[rcnns[:,0] >= prob_threshold]
             rcnns = rcnns[:, [3, 2, 1, 4, 0]]
+            rcnns[:, [0, 1, 2]] = rcnns[:, [0, 1, 2]] + shift
             names = np.array([[pid]] * len(rcnns))
             rcnn_res.append(np.concatenate([names, rcnns], axis=1))
 
         if os.path.exists(os.path.join(save_dir, '%s_ensembles.npy' % (pid))):
             ensembles = np.load(os.path.join(save_dir, '%s_ensembles.npy' % (pid)))
+            ensembles = ensembles[ensembles[:,0] >= prob_threshold]
             ensembles = ensembles[:, [3, 2, 1, 4, 0]]
+            ensembles[:, [0, 1, 2]] = ensembles[:, [0, 1, 2]] + shift
             names = np.array([[pid]] * len(ensembles))
             ensemble_res.append(np.concatenate([names, ensembles], axis=1))
     
@@ -223,16 +244,37 @@ def eval(net, dataset, save_dir=None):
     if not os.path.exists(os.path.join(eval_dir, 'ensemble')):
         os.makedirs(os.path.join(eval_dir, 'ensemble'))
 
-    noduleCADEvaluation('evaluationScript/annotations/LIDC/3_annotation.csv',
-    'evaluationScript/annotations/LIDC/3_annotation_excluded.csv',
+    #noduleCADEvaluation('evaluationScript/annotations/LIDC/3_annotation.csv',
+    #'evaluationScript/annotations/LIDC/3_annotation_excluded.csv',
+    #dataset.set_name, rpn_submission_path, os.path.join(eval_dir, 'rpn'))
+
+    #noduleCADEvaluation('evaluationScript/annotations/LIDC/3_annotation.csv',
+    #'evaluationScript/annotations/LIDC/3_annotation_excluded.csv',
+    #dataset.set_name, rcnn_submission_path, os.path.join(eval_dir, 'rcnn'))
+
+    #noduleCADEvaluation('evaluationScript/annotations/LIDC/3_annotation.csv',
+    #'evaluationScript/annotations/LIDC/3_annotation_excluded.csv',
+    #dataset.set_name, ensemble_submission_path, os.path.join(eval_dir, 'ensemble'))
+
+    #noduleCADEvaluation('/home/vincentwu/luna16/annotations.csv',
+    #'/home/vincentwu/luna16/annotations_excluded.csv',
+    #dataset.set_name, rpn_submission_path, os.path.join(eval_dir, 'rpn'))
+
+    #noduleCADEvaluation('/home/vincentwu/luna16/annotations.csv',
+    #'/home/vincentwu/luna16/annotations_excluded.csv',
+    #dataset.set_name, rcnn_submission_path, os.path.join(eval_dir, 'rcnn'))
+
+    #noduleCADEvaluation('/home/vincentwu/luna16/annotations.csv',
+    #'/home/vincentwu/luna16/annotations_excluded.csv',
+    #dataset.set_name, ensemble_submission_path, os.path.join(eval_dir, 'ensemble'))
+
+    noduleCADEvaluation('/mnt/QNAP/home/jenny/CGH_LungNodule/CGH_annotations_iou1_ALD_fixmerge.csv', None,
     dataset.set_name, rpn_submission_path, os.path.join(eval_dir, 'rpn'))
 
-    noduleCADEvaluation('evaluationScript/annotations/LIDC/3_annotation.csv',
-    'evaluationScript/annotations/LIDC/3_annotation_excluded.csv',
+    noduleCADEvaluation('/mnt/QNAP/home/jenny/CGH_LungNodule/CGH_annotations_iou1_ALD_fixmerge.csv', None,
     dataset.set_name, rcnn_submission_path, os.path.join(eval_dir, 'rcnn'))
 
-    noduleCADEvaluation('evaluationScript/annotations/LIDC/3_annotation.csv',
-    'evaluationScript/annotations/LIDC/3_annotation_excluded.csv',
+    noduleCADEvaluation('/mnt/QNAP/home/jenny/CGH_LungNodule/CGH_annotations_iou1_ALD_fixmerge.csv', None,
     dataset.set_name, ensemble_submission_path, os.path.join(eval_dir, 'ensemble'))
         
     print

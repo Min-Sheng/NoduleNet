@@ -346,7 +346,7 @@ def evaluateCAD(seriesUIDs, results_filename, outputDir, allNodules, CADSystemNa
     if performBootstrapping:
         fps_bs_itp,sens_bs_mean,sens_bs_lb,sens_bs_up = computeFROC_bootstrap(FROCGTList,FROCProbList,FPDivisorList,seriesUIDs,excludeList,
                                                                   numberOfBootstrapSamples=numberOfBootstrapSamples, confidence = confidence)
-        
+
     # Write FROC curve
     with open(os.path.join(outputDir, "froc_%s.txt" % CADSystemName), 'w') as f:
         for i in range(len(sens)):
@@ -409,13 +409,33 @@ def evaluateCAD(seriesUIDs, results_filename, outputDir, allNodules, CADSystemNa
     def find_nearest(array,value):
         idx = np.where((fps - value) == (fps - value)[(fps - value) >= 0].min())[0][-1]
         return idx
-    thres = [0.125,0.25,0.5,1,2,4,8]
-    sen = []
-    print('FROC at points: ', thres)
-    for th in thres:
-        print('fps: ', th, ', sensitivity: ', sens[find_nearest(fps, th)])
-        sen.append(sens[find_nearest(fps, th)])
-    print('=============================================\naverage FROC: ', np.mean(sen))
+    
+    # write 7 @FPs to .txt
+    nodOutputfile.write("\n#### Recall(%)@FPs ####\n")
+    print ("#### Recall(%)@FPs ####")
+
+    if bPerformBootstrapping:
+        thres = [0.125, 0.25, 0.5, 1, 2, 4, 8]
+        sen = []
+        for i in range(len(fps_bs_itp)):
+            if round(fps_bs_itp[i],3) in froc_list:
+                print('fps: ', round(fps_bs_itp[i],3), ', sensitivity: ', sens_bs_mean[i])
+                nodOutputfile.write('Sensitivity/FPs: {:.3f}, {:.3f}\n'.format(sens_bs_mean[i], round(fps_bs_itp[i],3)))
+                sen.append(sens_bs_mean[i])
+        print('Mean sensitivity: ', np.mean(np.array(sen)))
+        nodOutputfile.write('Mean sensitivity: {}\n'.format(np.mean(np.array(sen))))
+    else:
+        thres = [0.125,0.25,0.5,1,2,4,8]
+        sen = []
+        print('FROC at points: ', thres)
+        for th in thres:
+            sensitivity = sens[find_nearest(fps, th)]
+            print('fps: ', th, ', sensitivity: ', sensitivity)
+            nodOutputfile.write('Sensitivity/FPs: {:.3f}, {:.3f}\n'.format(sensitivity, th))
+            sen.append(sensitivity)
+        avg_sen = np.mean(sen)
+        print('=============================================\naverage FROC: ', avg_sen)
+        nodOutputfile.write('Mean sensitivity: {}\n'.format(avg_sen))
     return (fps, sens, thresholds, fps_bs_itp, sens_bs_mean, sens_bs_lb, sens_bs_up)
     
 def getNodule(annotation, header, state = ""):
@@ -457,13 +477,14 @@ def collectNoduleAnnotations(annotations, annotations_excluded, seriesUIDs):
                 numberOfIncludedNodules += 1
         
         # add excluded findings
-        header = annotations_excluded[0]
-        for annotation in annotations_excluded[1:]:
-            nodule_seriesuid = annotation[header.index(seriesuid_label)]
-            
-            if seriesuid == nodule_seriesuid:
-                nodule = getNodule(annotation, header, state = "Excluded")
-                nodules.append(nodule)
+        if len(annotations_excluded) > 0:
+            header = annotations_excluded[0]
+            for annotation in annotations_excluded[1:]:
+                nodule_seriesuid = annotation[header.index(seriesuid_label)]
+                
+                if seriesuid == nodule_seriesuid:
+                    nodule = getNodule(annotation, header, state = "Excluded")
+                    nodules.append(nodule)
             
         allNodules[seriesuid] = nodules
         noduleCount      += numberOfIncludedNodules
@@ -476,7 +497,10 @@ def collectNoduleAnnotations(annotations, annotations_excluded, seriesUIDs):
     
 def collect(annotations_filename,annotations_excluded_filename,seriesuids_filename):
     annotations          = csvTools.readCSV(annotations_filename)
-    annotations_excluded = csvTools.readCSV(annotations_excluded_filename)
+    if annotations_excluded_filename is None:
+        annotations_excluded = []
+    else:
+        annotations_excluded = csvTools.readCSV(annotations_excluded_filename)
     seriesUIDs_csv = csvTools.readCSV(seriesuids_filename)
     
     seriesUIDs = []
