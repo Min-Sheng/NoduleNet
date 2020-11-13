@@ -25,7 +25,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 from PIL import Image, ImageDraw
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 
 this_module = sys.modules[__name__]
 print("Is CUDA available: ", torch.cuda.is_available())
@@ -236,6 +236,18 @@ def main():
     val_writer.close()
 
 def plot_bbox_and_lhi(img, pred_bboxes, gt_bboxes, crop_lhi, crop_ims, width=1, resize_scale=2, thres=0.7):
+    """
+    Input:
+        img -> tensor: 3D CT images
+        pred_bboxes -> list of list: the predicted bboxes
+        gt_bboxes -> tensor: the GT bboxes
+        crop_lhi -> tensor: the LHI images computed from the cropped CT slices
+        crop_ims -> list of tensor: the cropped CT slices
+    Return:
+        draw_img -> list of tensor: the 2D CT slices painted with bboxes and GT bboxes
+        lhi_img -> list of tensor: the LHI images to be drawn
+        crop_img -> list of tensor: the cropped CT slices to be drawn
+    """
     B, _, D, H, W = img.shape
     pred_bboxes = [[pred_bbox for pred_bbox in pred_bboxes if pred_bbox[0]==b] for b in range(B)]
     draw_img = []
@@ -243,6 +255,8 @@ def plot_bbox_and_lhi(img, pred_bboxes, gt_bboxes, crop_lhi, crop_ims, width=1, 
     crop_img = []
     idx_lhi = 0
     for b in range(B):
+
+        # Find the first predicted bbox whose probability is large than threshold
         idx = 0
         found = 0
         for i in range(len(pred_bboxes[b])):
@@ -252,6 +266,7 @@ def plot_bbox_and_lhi(img, pred_bboxes, gt_bboxes, crop_lhi, crop_ims, width=1, 
                 break
             idx += 1
 
+        # Store the corresponding LHI image
         if found:
             idx_lhi += idx
             lhi_img.append(crop_lhi[idx_lhi])
@@ -262,6 +277,7 @@ def plot_bbox_and_lhi(img, pred_bboxes, gt_bboxes, crop_lhi, crop_ims, width=1, 
                 crop_img.append(torch.from_numpy(np.array(crop_im)).permute(2,1,0))
             idx_lhi += len(pred_bboxes[b][idx:])
 
+        # Skip when no predicted bbox whose probability is large than threshold is found
         else:
             idx_lhi += len(pred_bboxes[b])
             continue
@@ -273,14 +289,17 @@ def plot_bbox_and_lhi(img, pred_bboxes, gt_bboxes, crop_lhi, crop_ims, width=1, 
         ndarr = unnorm_img.div(unnorm_img.max()).mul(255).add_(0.5).clamp_(0, 255).to('cpu', torch.uint8).numpy()
         im = Image.fromarray(ndarr).convert('RGB').resize((W*resize_scale, H*resize_scale))
         draw = ImageDraw.Draw(im)
+        # Draw the target predicted bbox on the image 
         draw.rectangle([int(x_start*resize_scale), int(y_start*resize_scale), int(x_end*resize_scale), int(y_end*resize_scale)], outline=(255,0,0), width=width)
         
+        # Draw the predicted whose which z-position is within the range of the target predicted bbox
         for next_pred_bbox in pred_bboxes[b][idx_lhi+1:]:
             _, p, next_z_start, next_y_start, next_x_start, next_z_end, next_y_end, next_x_end = next_pred_bbox
             next_z = int((next_z_start + next_z_end)/2)
             if p >= thres and z_start <= next_z <= z_end:
                 draw.rectangle([int(next_x_start*resize_scale), int(next_y_start*resize_scale), int(next_x_end*resize_scale), int(next_y_end*resize_scale)], outline=(0,0,255), width=width)
         
+        # Draw the GT bboxes whose z-position is within the range of the target predicted bbox
         for gt_bbox in gt_bboxes[b]:
             gt_z, gt_y, gt_x, gt_d, gt_h, gt_w = gt_bbox
             if z_start <= gt_z <= z_end:
@@ -289,7 +308,7 @@ def plot_bbox_and_lhi(img, pred_bboxes, gt_bboxes, crop_lhi, crop_ims, width=1, 
                 draw.rectangle([int(gt_x_start*resize_scale), int(gt_y_start*resize_scale), int(gt_x_end*resize_scale), int(gt_y_end*resize_scale)], outline=(0,255,0), width=width)
 
         draw_img.append(torch.from_numpy(np.array(im)).permute(2,1,0))
-    return draw_img, lhi_img
+    return draw_img, lhi_img, crop_img
 
 def train(net, train_loader, optimizer, epoch, writer):
     net.set_mode('train')
@@ -429,8 +448,8 @@ def train(net, train_loader, optimizer, epoch, writer):
             writer.add_image('RCNN Pred.', grid, epoch)
             lhi_grid = torchvision.utils.make_grid(lhi_img, nrow=3, normalize=True)
             writer.add_image('LHI Img.', lhi_grid, epoch)
-            #crop_grid = torchvision.utils.make_grid(crop_img, nrow=3)
-            #writer.add_image('Cropped Img.', crop_grid, epoch)
+            crop_grid = torchvision.utils.make_grid(crop_img, nrow=3)
+            writer.add_image('Cropped Img.', crop_grid, epoch)
         
 
     if net.use_mask:
@@ -561,8 +580,8 @@ def validate(net, val_loader, epoch, writer):
             writer.add_image('RCNN Pred.', grid, epoch)
             lhi_grid = torchvision.utils.make_grid(lhi_img, nrow=3, normalize=True)
             writer.add_image('LHI Img.', lhi_grid, epoch)
-            #crop_grid = torchvision.utils.make_grid(crop_img, nrow=3)
-            #writer.add_image('Cropped Img.', crop_grid, epoch)
+            crop_grid = torchvision.utils.make_grid(crop_img, nrow=3)
+            writer.add_image('Cropped Img.', crop_grid, epoch)
         
     if net.use_mask:
         mask_stats = np.array(mask_stats)

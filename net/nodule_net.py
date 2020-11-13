@@ -300,7 +300,6 @@ class LHIHead(nn.Module):
             lhi_im = self.compute_LHI(im)
             lhi_ims.append(lhi_im)
         
-        #ims = torch.cat(ims, 0).unsqueeze(1)
         lhi_ims = torch.cat(lhi_ims, 0).unsqueeze(1)
         #print("crop_lhi:", crop_lhi.shape)
         x = self.conv1(lhi_ims)
@@ -312,7 +311,7 @@ class LHIHead(nn.Module):
         logits = self.logits(x)
         deltas = self.deltas(x)
 
-        return logits, deltas, lhi_ims, #ims
+        return logits, deltas, lhi_ims, ims
 
 def crop_mask_regions(masks, crop_boxes):
     out = []
@@ -490,7 +489,7 @@ class NoduleNet(nn.Module):
                 if self.use_lhi:
                     # Make sure to keep inputs not splitted by data parallel
                     inputs = inputs.unsqueeze(0).expand(torch.cuda.device_count(), -1, -1, -1, -1, -1)
-                    self.lhi_logits, self.lhi_deltas, self.crop_lhi = data_parallel(self.lhi_head, (torch.from_numpy(self.lhi_crop_boxes).cuda(), inputs))
+                    self.lhi_logits, self.lhi_deltas, self.crop_lhi, self.crop_ims = data_parallel(self.lhi_head, (torch.from_numpy(self.lhi_crop_boxes).cuda(), inputs))
 
                 if self.mode in ['eval', 'test']:
                     if self.use_mask:
