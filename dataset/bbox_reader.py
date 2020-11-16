@@ -7,6 +7,8 @@ import warnings
 from scipy.ndimage.interpolation import rotate
 import math
 import time
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning) 
 
 class BboxReader(Dataset):
     def __init__(self, data_dir, set_name, cfg, mode='train', split_combiner=None, lungmask_dir=None):
@@ -88,7 +90,7 @@ class BboxReader(Dataset):
                 sample, target, bboxes, coord = self.crop(imgs, bbox[1:], bboxes,isScale,is_random_crop)
                 if self.mode == 'train' and not is_random_crop:
                      sample, target, bboxes = augment(sample, target, bboxes, do_flip = self.augtype['flip'], 
-                                                             do_rotate=self.augtype['rotate'], do_swap = self.augtype['swap'])
+                                                             do_rotate=self.augtype['rotate'], do_swap = self.augtype['swap'], pad_value=self.pad_value)
             else:
                 randimid = np.random.randint(len(self.filenames))
                 filename = self.filenames[randimid]
@@ -140,7 +142,7 @@ class BboxReader(Dataset):
                 lungmask = self.load_lungmask(self.filenames[idx])[0]
                 image = image * lungmask
 
-            image = pad2factor(image[0])
+            image = pad2factor(image[0], self.pad_value)
             image = np.expand_dims(image, 0)
 
             # if self.source[idx] == 'luna':
@@ -206,7 +208,7 @@ def fillter_box(bboxes, size):
             res.append(box)
     return np.array(res)
 
-def augment(sample, target, bboxes, do_flip = True, do_rotate=True, do_swap = True):
+def augment(sample, target, bboxes, do_flip = True, do_rotate=True, do_swap = True, pad_value=0.0):
     #                     angle1 = np.random.rand()*180
     if do_rotate:
         validrot = False
@@ -220,7 +222,7 @@ def augment(sample, target, bboxes, do_flip = True, do_rotate=True, do_swap = Tr
             if np.all(newtarget[:3]>target[3]) and np.all(newtarget[:3]< np.array(sample.shape[1:4])-newtarget[3]):
                 validrot = True
                 target = newtarget
-                sample = rotate(sample,angle1,axes=(2,3),reshape=False)
+                sample = rotate(sample,angle1,axes=(2,3),reshape=False, mode='constant', cval=pad_value)
                 for box in bboxes:
                     box[1:3] = np.dot(rotmat,box[1:3]-size/2)+size/2
             else:
@@ -251,7 +253,7 @@ class Crop(object):
         self.stride = config['stride']
         self.pad_value = config['pad_value']
 
-    def __call__(self, imgs, target, bboxes,isScale=False,isRand=False):
+    def __call__(self, imgs, target, bboxes,isScale=False,isRand=False, lungmask=None):
         if isScale:
             radiusLim = [8.,120.]
             scaleLim = [0.75,1.25]
@@ -300,11 +302,35 @@ class Crop(object):
             max(start[1],0):min(start[1] + crop_size[1],imgs.shape[2]),
             max(start[2],0):min(start[2] + crop_size[2],imgs.shape[3])]
         crop = np.pad(crop,pad,'constant',constant_values =self.pad_value)
+        if lungmask is not None:
+            crop_lungmask = lungmask[:,
+                max(start[0],0):min(start[0] + crop_size[0],imgs.shape[1]),
+                max(start[1],0):min(start[1] + crop_size[1],imgs.shape[2]),
+                max(start[2],0):min(start[2] + crop_size[2],imgs.shape[3])]
+            crop_lungmask = np.pad(crop_lungmask,pad,'constant',constant_values =self.pad_value)
+        
         for i in range(3):
             target[i] = target[i] - start[i]
+        if lungmask is not None:
+            if crop_lungmask[0,int(target[0]), int(target[1]), int(target[2])] == 0:
+                print("Bbox is outside the lungmask", target[i])
+        
+        filtered_bboxes = []
         for i in range(len(bboxes)):
-            for j in range(3):
-                bboxes[i][j] = bboxes[i][j] - start[j]
+            if bboxes[i][0] < start[0] + crop_size[0] and\
+                bboxes[i][1] < start[1] + crop_size[1] and\
+                bboxes[i][2] < start[2] + crop_size[2] and\
+                bboxes[i][0] >= start[0] and\
+                bboxes[i][1] >= start[1] and\
+                bboxes[i][2] >= start[2]:
+                for j in range(3):
+                    bboxes[i][j] = bboxes[i][j] - start[j]
+                filtered_bboxes.append(bboxes[i])
+                if lungmask is not None:
+                    if crop_lungmask[0,int(bboxes[i][0]), int(bboxes[i][1]), int(bboxes[i][2])] == 0:
+                        print("Bbox is outside the lungmask", bboxes[i])
+        filtered_bboxes = np.stack(filtered_bboxes)
+        bboxes = filtered_bboxes
 
         if isScale:
             with warnings.catch_warnings():
